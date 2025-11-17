@@ -21,7 +21,6 @@ namespace NeocortexSpeechContext
         [SerializeField] private VoiceInputModeController voiceController;
         [SerializeField] private ContextInputFieldController contextField;
         [SerializeField] private ConversationHistoryDisplay historyDisplay;
-        [SerializeField] private AudioSource playbackAudioSource;
 
         [Header("Participant Configuration")]
         [SerializeField] private string playerDisplayName = "Player";
@@ -35,8 +34,14 @@ namespace NeocortexSpeechContext
         [Header("Persistence")]
         [SerializeField] private string logDirectoryName = "ConversationLogs";
         [SerializeField] private bool prettyPrintLog = true;
+        
+        [Header("Debug")]
+        [SerializeField] private bool enablePromptLogging = true;
+        [SerializeField] private bool enableVerboseLogging = false;
 
         private readonly Dictionary<NeocortexSmartAgent, AgentSubscription> agentSubscriptions = new();
+        private readonly HashSet<string> agentsWithContextSent = new();
+        private string lastParticipantListHash = string.Empty;
 
         private ConversationAgentProfile currentAgent;
         private Coroutine agentCycleRoutine;
@@ -60,7 +65,6 @@ namespace NeocortexSpeechContext
             voiceController = FindObjectOfType<VoiceInputModeController>();
             contextField = FindObjectOfType<ContextInputFieldController>();
             historyDisplay = FindObjectOfType<ConversationHistoryDisplay>();
-            playbackAudioSource = FindObjectOfType<AudioSource>();
         }
 
         private void OnEnable()
@@ -197,7 +201,31 @@ namespace NeocortexSpeechContext
                 return string.Empty;
             }
 
-            return contextBuilder.BuildPrompt(agent, conversationLog, string.Empty);
+            // Get all participating agents for context
+            var allAgents = roster?.BaseOrder;
+            
+            // Check if we need to include participant context
+            bool includeParticipantContext = ShouldIncludeParticipantContext(agent, allAgents);
+            
+            var prompt = contextBuilder.BuildPrompt(agent, conversationLog, string.Empty, playerDisplayName, allAgents, includeParticipantContext);
+            
+            // Log the prompt being sent to AI for debugging
+            if (enablePromptLogging && !string.IsNullOrWhiteSpace(prompt))
+            {
+                var agentName = agent?.DisplayName ?? "Unknown";
+                Debug.Log($"[ConversationCoordinator] Sending prompt to {agentName}:\n{prompt}");
+                
+                if (enableVerboseLogging)
+                {
+                    Debug.Log($"[ConversationCoordinator] Prompt details for {agentName}:\n" +
+                              $"Length: {prompt.Length} characters\n" +
+                              $"Lines: {prompt.Split('\n').Length}\n" +
+                              $"Agent ID: {agent?.AgentId}\n" +
+                              $"Project ID: {agent?.ProjectId}");
+                }
+            }
+            
+            return prompt;
         }
 
         private bool IsAgentInteractive(ConversationAgentProfile agent)
@@ -268,13 +296,17 @@ namespace NeocortexSpeechContext
 
         private IEnumerator PlayAudioAndCompleteTurn(AudioClip clip)
         {
-            if (playbackAudioSource != null && clip != null)
+            if (currentAgent?.SmartAgent != null && clip != null)
             {
-                playbackAudioSource.Stop();
-                playbackAudioSource.clip = clip;
-                playbackAudioSource.Play();
+                var audioSource = GetOrCreateAgentAudioSource(currentAgent.SmartAgent);
+                if (audioSource != null)
+                {
+                    audioSource.Stop();
+                    audioSource.clip = clip;
+                    audioSource.Play();
 
-                yield return new WaitForSeconds(Mathf.Max(0f, clip.length));
+                    yield return new WaitForSeconds(Mathf.Max(0f, clip.length));
+                }
             }
 
             awaitingAgentResponse = false;
@@ -419,6 +451,105 @@ namespace NeocortexSpeechContext
 
             smartAgent = profile.SmartAgent;
             return smartAgent != null;
+        }
+
+        /// <summary>
+        /// Determines if participant context should be included for this agent.
+        /// Returns true for first-time agents or when participant list has changed.
+        /// </summary>
+        private bool ShouldIncludeParticipantContext(ConversationAgentProfile agent, IReadOnlyList<ConversationAgentProfile> allAgents)
+        {
+            if (agent == null)
+            {
+                return false;
+            }
+
+            // Check if this agent has received context before
+            bool isFirstTime = !agentsWithContextSent.Contains(agent.AgentId);
+            
+            // Generate current participant list hash
+            var currentHash = GenerateParticipantListHash(allAgents);
+            bool participantsChanged = !string.Equals(lastParticipantListHash, currentHash, StringComparison.Ordinal);
+            
+            // Include context if it's first time or participants changed
+            bool shouldInclude = isFirstTime || participantsChanged;
+            
+            if (shouldInclude)
+            {
+                // Mark this agent as having received context
+                agentsWithContextSent.Add(agent.AgentId);
+                
+                // Update the participant list hash if it changed
+                if (participantsChanged)
+                {
+                    lastParticipantListHash = currentHash;
+                    // Clear the tracking set since all agents need updated context
+                    agentsWithContextSent.Clear();
+                    agentsWithContextSent.Add(agent.AgentId);
+                }
+                
+                if (enableVerboseLogging)
+                {
+                    var reason = isFirstTime ? "first time" : "participants changed";
+                    Debug.Log($"[ConversationCoordinator] Including participant context for {agent.DisplayName} ({reason})");
+                }
+            }
+            
+            return shouldInclude;
+        }
+
+        /// <summary>
+        /// Generates a hash string representing the current participant list for change detection.
+        /// </summary>
+        private string GenerateParticipantListHash(IReadOnlyList<ConversationAgentProfile> allAgents)
+        {
+            var participants = new List<string> { playerDisplayName ?? "Player" };
+            
+            if (allAgents != null)
+            {
+                foreach (var agent in allAgents)
+                {
+                    if (agent != null && agent.ParticipatesInConversation && !string.IsNullOrWhiteSpace(agent.DisplayName))
+                    {
+                        participants.Add($"{agent.AgentId}:{agent.DisplayName}");
+                    }
+                }
+            }
+            
+            participants.Sort(); // Ensure consistent ordering
+            return string.Join("|", participants);
+        }
+
+        /// <summary>
+        /// Gets or creates an AudioSource component for the specified SmartAgent.
+        /// This enables 3D positional audio for each agent.
+        /// </summary>
+        private AudioSource GetOrCreateAgentAudioSource(NeocortexSmartAgent smartAgent)
+        {
+            if (smartAgent == null)
+            {
+                return null;
+            }
+
+            // Try to find existing AudioSource on the SmartAgent GameObject
+            var audioSource = smartAgent.GetComponent<AudioSource>();
+            
+            if (audioSource == null)
+            {
+                // Create new AudioSource at runtime if none exists
+                audioSource = smartAgent.gameObject.AddComponent<AudioSource>();
+                
+                // Configure for 3D spatial audio
+                audioSource.spatialBlend = 1.0f; // Full 3D
+                audioSource.rolloffMode = AudioRolloffMode.Logarithmic;
+                audioSource.minDistance = 1.0f;
+                audioSource.maxDistance = 20.0f;
+                audioSource.playOnAwake = false;
+                
+                Debug.Log($"[ConversationCoordinator] Created AudioSource for agent '{smartAgent.name}' with 3D spatial audio settings.");
+            }
+            
+            return audioSource;
         }
 
         private sealed class AgentSubscription

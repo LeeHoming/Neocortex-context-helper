@@ -90,6 +90,42 @@ namespace NeocortexSpeechContext
         }
 
         /// <summary>
+        /// Returns all turns that occurred after the agent's last speech.
+        /// If the agent has never spoken, returns all turns.
+        /// </summary>
+        public List<ConversationTurn> GetTurnsSinceLastAgentSpeak(string agentId)
+        {
+            var results = new List<ConversationTurn>();
+            
+            if (string.IsNullOrEmpty(agentId) || turns.Count == 0)
+            {
+                return results;
+            }
+
+            // Find the last turn where this agent spoke
+            int lastAgentTurnIndex = -1;
+            for (int i = turns.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(turns[i].SpeakerId, agentId, StringComparison.Ordinal))
+                {
+                    lastAgentTurnIndex = i;
+                    break;
+                }
+            }
+
+            // If agent never spoke, return all turns
+            // If agent spoke, return all turns after their last speech
+            int startIndex = lastAgentTurnIndex == -1 ? 0 : lastAgentTurnIndex + 1;
+            
+            for (int i = startIndex; i < turns.Count; i++)
+            {
+                results.Add(turns[i]);
+            }
+
+            return results;
+        }
+
+        /// <summary>
         /// Saves the log to disk as JSON.
         /// </summary>
         public void SaveToDisk(string directoryPath, string fileName, bool prettyPrint)
